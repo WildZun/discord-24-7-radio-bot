@@ -1,0 +1,42 @@
+{
+  "name": "discord-24-7-radio-bot",
+  "version": "1.0.0",
+  "description": "A simple Discord bot for 24/7 webradio streaming with automatic reconnection",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "keywords": [
+    "discord",
+    "bot", 
+    "radio",
+    "music",
+    "24/7",
+    "streaming",
+    "webradio"
+  ],
+  "author": "WildZun",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WildZun/discord-24-7-radio-bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WildZun/discord-24-7-radio-bot/issues"
+  },
+  "homepage": "https://github.com/WildZun/discord-24-7-radio-bot#readme",
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "@discordjs/voice": "^0.17.0",
+    "dotenv": "^16.4.5",
+    "opusscript": "^0.1.1",
+    "libsodium-wrappers": "^0.7.15"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
