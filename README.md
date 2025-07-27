@@ -39,6 +39,12 @@ DISCORD_TOKEN=your_discord_bot_token_here
 RADIO_URL=https://your-radio-stream.mp3
 ```
 
+You can use `.env.example` as a template:
+```bash
+cp .env.example .env
+# Then edit .env with your actual values
+```
+
 4. **Start the bot:**
 ```bash
 npm start
@@ -47,6 +53,76 @@ npm start
 For development with auto-restart:
 ```bash
 npm run dev
+```
+
+## Docker Deployment
+
+### Using Docker
+
+1. **Build the Docker image:**
+
+```bash
+docker build -t discord-radio-bot .
+```
+
+2. **Run with environment variables:**
+
+```bash
+docker run -d \
+  --name radio-bot \
+  -e DISCORD_TOKEN=your_discord_bot_token_here \
+  -e RADIO_URL=https://your-radio-stream.mp3 \
+  --restart unless-stopped \
+  discord-radio-bot
+```
+
+### Using Docker Compose
+
+1. **Configure environment variables:**
+
+Copy the environment template:
+```bash
+cp .env.docker .env
+```
+
+Edit `.env` file with your actual values:
+```env
+DISCORD_TOKEN=your_actual_discord_bot_token
+RADIO_URL=https://your-actual-radio-stream.mp3
+```
+
+2. **Start with Docker Compose:**
+
+```bash
+docker-compose up -d
+```
+
+### Docker Management Commands
+
+```bash
+# View logs
+docker logs radio-bot
+# or with docker-compose
+docker-compose logs
+
+# Stop the container
+docker stop radio-bot
+# or with docker-compose
+docker-compose stop
+
+# Start the container
+docker start radio-bot
+# or with docker-compose
+docker-compose start
+
+# Remove the container
+docker rm radio-bot
+# or with docker-compose
+docker-compose down
+
+# Update and restart
+docker-compose pull
+docker-compose up -d
 ```
 
 ## Commands

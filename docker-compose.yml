@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  radio-bot:
+    build: .
+    container_name: discord-radio-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - RADIO_URL=${RADIO_URL}
+    restart: unless-stopped
+    volumes:
+      # Optional: mount logs directory if you want to persist logs
+      - ./logs:/app/logs
+    # Uncomment the following lines if you need to bind to specific network interfaces
+    # networks:
+    #   - bot-network
+
+# Uncomment if you need a custom network
+# networks:
+#   bot-network:
+#     driver: bridge
