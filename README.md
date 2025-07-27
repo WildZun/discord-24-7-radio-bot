@@ -14,13 +14,14 @@ Un bot Discord simple pour diffuser une webradio 24h/24 avec reconnexion automat
 
 ### Avec Docker (recommandé)
 
-1. **Cloner le projet:**
+**Option 1: Docker Compose**
+1. **Télécharger les fichiers:**
 ```bash
-git clone https://github.com/WildZun/discord-24-7-radio-bot.git
-cd discord-24-7-radio-bot
+wget https://raw.githubusercontent.com/WildZun/discord-24-7-radio-bot/master/docker-compose.yml
+wget https://raw.githubusercontent.com/WildZun/discord-24-7-radio-bot/master/.env.docker
 ```
 
-2. **Configurer les variables:**
+2. **Configurer:**
 ```bash
 cp .env.docker .env
 # Éditer .env avec ton token Discord et l'URL de la radio
@@ -29,6 +30,32 @@ cp .env.docker .env
 3. **Démarrer:**
 ```bash
 docker-compose up -d
+```
+
+**Option 2: Docker direct**
+1. **Créer le fichier .env:**
+```bash
+echo "DISCORD_TOKEN=ton_token_discord" > .env
+echo "RADIO_URL=https://ton-stream-radio.mp3" >> .env
+```
+
+2. **Démarrer le container:**
+```bash
+docker run -d \
+  --name discord-radio-bot \
+  --env-file .env \
+  --restart unless-stopped \
+  wildzun/discord-24-7:latest
+```
+
+**Option 3: Docker avec variables directes**
+```bash
+docker run -d \
+  --name discord-radio-bot \
+  -e DISCORD_TOKEN=ton_token_discord \
+  -e RADIO_URL=https://ton-stream-radio.mp3 \
+  --restart unless-stopped \
+  wildzun/discord-24-7:latest
 ```
 
 ### Installation classique
@@ -63,23 +90,6 @@ RADIO_URL=https://ton-stream-radio.mp3
 | `/disconnect` | Déconnecter le bot |
 | `/volume <1-100>` | Régler le volume |
 | `/info` | Infos système |
-
-## 🐳 Docker
-
-**Démarrer:**
-```bash
-docker-compose up -d
-```
-
-**Voir les logs:**
-```bash
-docker-compose logs
-```
-
-**Arrêter:**
-```bash
-docker-compose down
-```
 
 ## 🛠️ Dépannage
 
