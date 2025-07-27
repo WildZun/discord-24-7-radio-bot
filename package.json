@@ -2,10 +2,10 @@
   "name": "discord-24-7-radio-bot",
   "version": "1.0.0",
   "description": "A simple Discord bot for 24/7 webradio streaming with automatic reconnection",
-  "main": "bot.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "keywords": [
     "discord",
