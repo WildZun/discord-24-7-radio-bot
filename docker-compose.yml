@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   radio-bot:
-    build: .
+    image: wildzun/discord-24-7:latest
     container_name: discord-radio-bot
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
