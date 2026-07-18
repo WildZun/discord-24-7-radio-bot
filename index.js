@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const {
     joinVoiceChannel,
     createAudioPlayer,
@@ -9,7 +9,7 @@ const {
 } = require('@discordjs/voice');
 require('dotenv').config();
 const { spawn } = require('child_process');
-const { Readable } = require('stream');
+const ffmpegPath = require('ffmpeg-static');
 
 // Check and force the use of opusscript
 try {
@@ -42,7 +42,7 @@ console.log(`🤖 Bot token configuré: ${TOKEN.substring(0, 20)}...`);
 
 function checkFFmpeg() {
     return new Promise((resolve) => {
-        const ffmpeg = spawn('ffmpeg', ['-version']);
+        const ffmpeg = spawn(ffmpegPath, ['-version']);
 
         ffmpeg.on('error', () => resolve(false));
         ffmpeg.on('close', (code) => resolve(code === 0));
@@ -56,6 +56,10 @@ const client = new Client({
 const connections = new Map();
 const players = new Map();
 const reconnectTimers = new Map();
+const ffmpegProcesses = new Map();
+const activeStreams = new Set();
+const notificationChannels = new Map();
+const lastErrorNotices = new Map();
 
 client.once('ready', async () => {
     console.log(`${client.user.tag} est connecté et prêt !`);
@@ -104,75 +108,192 @@ client.on('interactionCreate', async interaction => {
         }
     } catch (err) {
         console.error('❌ Erreur commande:', err);
-        if (!interaction.replied) {
-            await interaction.reply({ content: '❌ Erreur pendant la commande.', ephemeral: true });
+        if (interaction.deferred) {
+            await interaction.editReply('❌ Impossible de lancer ou gérer ce flux radio. Consulte les logs du bot.');
+        } else if (!interaction.replied) {
+            await interaction.reply({ content: '❌ Erreur pendant la commande.', flags: MessageFlags.Ephemeral });
         }
     }
 });
 
-async function createRadioResource(url, guildId) {
-    try {
-        const ffmpeg = spawn('ffmpeg', [
-            '-i', url,
-            '-analyzeduration', '0',
-            '-loglevel', '0',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2',
-            'pipe:1'
-        ]);
+function stopFFmpeg(guildId) {
+    const ffmpeg = ffmpegProcesses.get(guildId);
+    ffmpegProcesses.delete(guildId);
 
-        const stream = Readable.from(ffmpeg.stdout);
+    if (ffmpeg && !ffmpeg.killed) ffmpeg.kill();
+}
 
-        const resource = createAudioResource(stream, {
-            inputType: StreamType.Raw,
-            inlineVolume: true,
-            metadata: { title: 'WebRadio 24/7' }
+function reportStreamError(guildId, error) {
+    console.error(`❌ Erreur flux radio pour ${guildId}:`, error);
+
+    const now = Date.now();
+    if (now - (lastErrorNotices.get(guildId) || 0) < 60000) return;
+    lastErrorNotices.set(guildId, now);
+
+    const channel = notificationChannels.get(guildId);
+    if (channel?.isTextBased()) {
+        channel.send('⚠️ Flux radio interrompu. Reconnexion automatique en cours.').catch(err => {
+            console.error(`❌ Impossible d’envoyer erreur flux pour ${guildId}:`, err);
         });
-
-        if (resource.volume) {
-            resource.volume.setVolume(0.5);
-        }
-
-        return resource;
-    } catch (error) {
-        console.error('❌ Erreur ressource FFmpeg:', error);
-        scheduleReconnect(guildId);
-        throw error;
     }
 }
 
+function stopStream(guildId, disconnect = false) {
+    activeStreams.delete(guildId);
+    lastErrorNotices.delete(guildId);
+    stopFFmpeg(guildId);
+
+    const timer = reconnectTimers.get(guildId);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(guildId);
+
+    const player = players.get(guildId);
+    if (player) player.stop();
+    players.delete(guildId);
+
+    if (disconnect) {
+        const connection = connections.get(guildId);
+        if (connection) connection.destroy();
+        connections.delete(guildId);
+        notificationChannels.delete(guildId);
+    }
+}
+
+function hasHumanListeners(guildId) {
+    const connection = connections.get(guildId);
+    const channelId = connection?.joinConfig.channelId;
+    const channel = client.guilds.cache.get(guildId)?.channels.cache.get(channelId);
+
+    return channel?.isVoiceBased() && channel.members.some(member => !member.user.bot);
+}
+
+function pauseStream(guildId) {
+    stopFFmpeg(guildId);
+    const player = players.get(guildId);
+    if (player) player.stop(true);
+    console.log(`⏸️ Flux suspendu pour ${guildId}: salon vocal vide`);
+}
+
+function createRadioResource(url, guildId) {
+    stopFFmpeg(guildId);
+
+    const ffmpeg = spawn(ffmpegPath, [
+        '-i', url,
+        '-analyzeduration', '0',
+        '-loglevel', 'error',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ffmpegProcesses.set(guildId, ffmpeg);
+
+    let stderr = '';
+    ffmpeg.stderr.on('data', chunk => {
+        stderr = `${stderr}${chunk}`.slice(-2000);
+    });
+
+    const handleFailure = error => {
+        if (ffmpegProcesses.get(guildId) !== ffmpeg) return;
+        ffmpegProcesses.delete(guildId);
+        if (!ffmpeg.killed) ffmpeg.kill();
+        reportStreamError(guildId, stderr ? `${error.message}\n${stderr.trim()}` : error);
+        scheduleReconnect(guildId);
+    };
+
+    ffmpeg.on('error', handleFailure);
+    ffmpeg.stdout.on('error', handleFailure);
+    ffmpeg.stderr.on('error', handleFailure);
+    ffmpeg.on('close', code => {
+        if (code !== 0) {
+            handleFailure(new Error(`FFmpeg arrêté avec code ${code}`));
+        } else if (activeStreams.has(guildId) && ffmpegProcesses.get(guildId) === ffmpeg) {
+            handleFailure(new Error('FFmpeg a arrêté le flux de façon inattendue'));
+        }
+    });
+
+    const resource = createAudioResource(ffmpeg.stdout, {
+        inputType: StreamType.Raw,
+        inlineVolume: true,
+        metadata: { title: 'WebRadio 24/7' }
+    });
+
+    if (resource.volume) resource.volume.setVolume(0.5);
+
+    return resource;
+}
+
+function startPlayback(guildId) {
+    if (!activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
+
+    const player = players.get(guildId);
+    if (!player || player.state.status !== AudioPlayerStatus.Idle) return;
+
+    const resource = createRadioResource(RADIO_URL, guildId);
+    player.play(resource);
+    console.log(`▶️ Flux lancé pour ${guildId}`);
+}
+
 function scheduleReconnect(guildId, delay = 10000) {
+    if (!activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
     if (reconnectTimers.has(guildId)) clearTimeout(reconnectTimers.get(guildId));
 
     const timer = setTimeout(async () => {
-        const conn = connections.get(guildId);
-        const player = players.get(guildId);
-        if (conn && player) {
+        if (reconnectTimers.get(guildId) !== timer) return;
+        reconnectTimers.delete(guildId);
+
+        if (!activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
+        if (players.has(guildId)) {
             try {
-                const resource = await createRadioResource(RADIO_URL, guildId);
-                player.play(resource);
+                startPlayback(guildId);
                 console.log(`✅ Reconnexion réussie pour ${guildId}`);
             } catch (err) {
                 console.error(`❌ Échec de reconnexion pour ${guildId}:`, err);
                 scheduleReconnect(guildId, Math.min(delay * 2, 60000));
             }
         }
-        reconnectTimers.delete(guildId);
     }, delay);
 
     reconnectTimers.set(guildId, timer);
 }
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+    const guildId = newState.guild.id;
+    const connection = connections.get(guildId);
+    const channelId = connection?.joinConfig.channelId;
+
+    if (!activeStreams.has(guildId) || !channelId) return;
+    if (oldState.channelId !== channelId && newState.channelId !== channelId) return;
+
+    if (!hasHumanListeners(guildId)) {
+        pauseStream(guildId);
+        return;
+    }
+
+    const timer = reconnectTimers.get(guildId);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(guildId);
+
+    try {
+        startPlayback(guildId);
+    } catch (err) {
+        reportStreamError(guildId, err);
+        scheduleReconnect(guildId);
+    }
+});
 
 async function handlePlay(interaction) {
     const voiceChannel = interaction.member.voice.channel;
     const guildId = interaction.guildId;
 
     if (!voiceChannel) {
-        return interaction.reply({ content: '❌ Rejoins un salon vocal d’abord !', ephemeral: true });
+        return interaction.reply({ content: '❌ Rejoins un salon vocal d’abord !', flags: MessageFlags.Ephemeral });
     }
 
     await interaction.deferReply();
+    stopStream(guildId, true);
+    activeStreams.add(guildId);
+    if (interaction.channel?.isTextBased()) notificationChannels.set(guildId, interaction.channel);
 
     const connection = joinVoiceChannel({
         channelId: voiceChannel.id,
@@ -181,9 +302,6 @@ async function handlePlay(interaction) {
     });
 
     const player = createAudioPlayer();
-    const resource = await createRadioResource(RADIO_URL, guildId);
-
-    player.play(resource);
     connection.subscribe(player);
 
     players.set(guildId, player);
@@ -196,36 +314,28 @@ async function handlePlay(interaction) {
 
     player.on('error', err => {
         console.error('❌ Erreur lecteur:', err);
+        if (activeStreams.has(guildId)) reportStreamError(guildId, err);
         scheduleReconnect(guildId);
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, () => {
         console.log('🔌 Déconnecté, tentative de reconnexion...');
+        if (activeStreams.has(guildId)) reportStreamError(guildId, new Error('Connexion vocale Discord interrompue'));
         scheduleReconnect(guildId);
     });
+
+    startPlayback(guildId);
 
     await interaction.editReply(`🎶 Radio lancée dans **${voiceChannel.name}** en 24/7`);
 }
 
 async function handleStop(interaction) {
-    const player = players.get(interaction.guildId);
-    if (player) player.stop();
-    if (reconnectTimers.has(interaction.guildId)) {
-        clearTimeout(reconnectTimers.get(interaction.guildId));
-        reconnectTimers.delete(interaction.guildId);
-    }
+    stopStream(interaction.guildId);
     await interaction.reply('⏹️ Radio arrêtée (bot reste connecté)');
 }
 
 async function handleDisconnect(interaction) {
-    const conn = connections.get(interaction.guildId);
-    const player = players.get(interaction.guildId);
-    if (player) player.stop();
-    if (conn) conn.destroy();
-
-    reconnectTimers.delete(interaction.guildId);
-    connections.delete(interaction.guildId);
-    players.delete(interaction.guildId);
+    stopStream(interaction.guildId, true);
 
     await interaction.reply('🔌 Déconnecté du vocal');
 }
@@ -233,14 +343,14 @@ async function handleDisconnect(interaction) {
 async function handleVolume(interaction) {
     const volume = interaction.options.getInteger('level');
     const player = players.get(interaction.guildId);
-    if (!player) return interaction.reply({ content: '❌ Aucun stream en cours.', ephemeral: true });
+    if (!player) return interaction.reply({ content: '❌ Aucun stream en cours.', flags: MessageFlags.Ephemeral });
 
     const resource = player.state.resource;
     if (resource?.volume) {
         resource.volume.setVolume(volume / 100);
         await interaction.reply(`🔊 Volume réglé à ${volume}%`);
     } else {
-        await interaction.reply({ content: '❌ Volume non disponible.', ephemeral: true });
+        await interaction.reply({ content: '❌ Volume non disponible.', flags: MessageFlags.Ephemeral });
     }
 }
 

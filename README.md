@@ -5,6 +5,7 @@ Un bot Discord simple pour diffuser une webradio 24h/24 avec reconnexion automat
 ## ✨ Fonctionnalités
 
 - 🎵 Diffusion radio 24/7
+- ⏸️ Flux suspendu quand le salon vocal est vide, repris au prochain join
 - 🔄 Reconnexion automatique
 - �️ Contrôle du volume
 - ⚡ Commandes slash modernes
@@ -15,10 +16,10 @@ Un bot Discord simple pour diffuser une webradio 24h/24 avec reconnexion automat
 ### Avec Docker (recommandé)
 
 **Option 1: Docker Compose**
-1. **Télécharger les fichiers:**
+1. **Cloner projet:**
 ```bash
-wget https://raw.githubusercontent.com/WildZun/discord-24-7-radio-bot/master/docker-compose.yml
-wget https://raw.githubusercontent.com/WildZun/discord-24-7-radio-bot/master/.env.docker
+git clone https://github.com/WildZun/discord-24-7-radio-bot.git
+cd discord-24-7-radio-bot
 ```
 
 2. **Configurer:**
@@ -29,7 +30,7 @@ cp .env.docker .env
 
 3. **Démarrer:**
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
 
 **Option 2: Docker direct**
@@ -39,28 +40,32 @@ echo "DISCORD_TOKEN=ton_token_discord" > .env
 echo "RADIO_URL=https://ton-stream-radio.mp3" >> .env
 ```
 
-2. **Démarrer le container:**
+2. **Construire et démarrer container:**
 ```bash
+docker build -t discord-24-7-radio-bot .
 docker run -d \
   --name discord-radio-bot \
   --env-file .env \
   --restart unless-stopped \
-  wildzun/discord-24-7:latest
+  --init \
+  discord-24-7-radio-bot
 ```
 
 **Option 3: Docker avec variables directes**
 ```bash
+docker build -t discord-24-7-radio-bot .
 docker run -d \
   --name discord-radio-bot \
   -e DISCORD_TOKEN=ton_token_discord \
   -e RADIO_URL=https://ton-stream-radio.mp3 \
   --restart unless-stopped \
-  wildzun/discord-24-7:latest
+  --init \
+  discord-24-7-radio-bot
 ```
 
 ### Installation classique
 
-1. **Prérequis:** Node.js 18+ et FFmpeg
+1. **Prérequis:** Node.js 22.12+ (FFmpeg est installé avec les dépendances npm)
 2. **Installation:**
 ```bash
 git clone https://github.com/WildZun/discord-24-7-radio-bot.git
@@ -93,7 +98,7 @@ RADIO_URL=https://ton-stream-radio.mp3
 
 ## 🛠️ Dépannage
 
-- **FFmpeg manquant:** `choco install ffmpeg` (Windows) ou `sudo apt install ffmpeg` (Linux)
+- **FFmpeg:** fourni par `ffmpeg-static` lors de `npm install`
 - **Erreurs Opus:** `npm install opusscript`
 - **Windows ARM:** `npm install --no-optional`
 
