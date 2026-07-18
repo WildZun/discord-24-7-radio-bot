@@ -1,4 +1,12 @@
 services:
+  init-data:
+    image: ghcr.io/wildzun/discord-24-7-radio-bot:master
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /app/data && chown -R 1000:1000 /app/data"]
+    restart: "no"
+    volumes:
+      - ./data:/app/data
+
   radio-bot:
     image: ghcr.io/wildzun/discord-24-7-radio-bot:master
     container_name: discord-radio-bot
@@ -9,7 +17,7 @@ services:
     restart: unless-stopped
     init: true
     volumes:
-      - radio-bot-data:/app/data
-
-volumes:
-  radio-bot-data:
+      - ./data:/app/data
+    depends_on:
+      init-data:
+        condition: service_completed_successfully

@@ -36,6 +36,8 @@ cp .env.docker .env
 docker compose up -d
 ```
 
+La base SQLite est conservée dans `./data/radio-bot.sqlite`.
+
 **Option 2: Docker direct**
 1. **Créer le fichier .env:**
 ```bash
