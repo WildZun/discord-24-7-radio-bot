@@ -11,6 +11,8 @@ Un bot Discord simple pour diffuser une webradio 24h/24 avec reconnexion automat
 - ⚡ Commandes slash modernes
 - 🐳 Compatible Docker
 
+L'image Docker utilise FFmpeg Debian. Installation Node utilise `ffmpeg-static`.
+
 ## � Installation rapide
 
 ### Avec Docker (recommandé)

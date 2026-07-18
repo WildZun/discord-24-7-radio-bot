@@ -9,7 +9,7 @@ const {
 } = require('@discordjs/voice');
 require('dotenv').config();
 const { spawn } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
 // Check and force the use of opusscript
 try {
