@@ -120,5 +120,6 @@ Thumbs.db
 *~
 
 # Bot specific
+data/
 config.json
 bot.log

@@ -9,6 +9,9 @@ const {
 } = require('@discordjs/voice');
 require('dotenv').config();
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
 // Check and force the use of opusscript
@@ -23,6 +26,7 @@ try {
 // Environment variables validation
 const TOKEN = process.env.DISCORD_TOKEN;
 const RADIO_URL = process.env.RADIO_URL;
+const databasePath = process.env.DATABASE_PATH || path.join(__dirname, 'data', 'radio-bot.sqlite');
 
 if (!TOKEN) {
     console.error('❌ DISCORD_TOKEN manquant dans les variables d\'environnement');
@@ -39,6 +43,22 @@ if (!RADIO_URL) {
 console.log('✅ Variables d\'environnement chargées');
 console.log(`📻 Radio URL configurée: ${RADIO_URL}`);
 console.log(`🤖 Bot token configuré: ${TOKEN.substring(0, 20)}...`);
+
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+const database = new DatabaseSync(databasePath);
+database.exec(`
+    CREATE TABLE IF NOT EXISTS radio_sessions (
+        guild_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL
+    )
+`);
+
+const getSessions = database.prepare('SELECT guild_id, channel_id FROM radio_sessions');
+const saveSession = database.prepare(`
+    INSERT INTO radio_sessions (guild_id, channel_id) VALUES (?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+`);
+const deleteSession = database.prepare('DELETE FROM radio_sessions WHERE guild_id = ?');
 
 function checkFFmpeg() {
     return new Promise((resolve) => {
@@ -91,6 +111,8 @@ client.once('ready', async () => {
     } catch (err) {
         console.error('❌ Erreur d’enregistrement des commandes:', err);
     }
+
+    await restoreSessions();
 });
 
 client.on('interactionCreate', async interaction => {
@@ -156,6 +178,59 @@ function stopStream(guildId, disconnect = false) {
         if (connection) connection.destroy();
         connections.delete(guildId);
         notificationChannels.delete(guildId);
+    }
+}
+
+function createVoiceSession(guildId, channelId, adapterCreator) {
+    const connection = joinVoiceChannel({ channelId, guildId, adapterCreator });
+    const player = createAudioPlayer();
+    connection.subscribe(player);
+
+    players.set(guildId, player);
+    connections.set(guildId, connection);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        console.log('⏳ Inactif, tentative de reconnexion...');
+        scheduleReconnect(guildId);
+    });
+
+    player.on('error', err => {
+        console.error('❌ Erreur lecteur:', err);
+        if (activeStreams.has(guildId)) reportStreamError(guildId, err);
+        scheduleReconnect(guildId);
+    });
+
+    connection.on(VoiceConnectionStatus.Disconnected, () => {
+        console.log('🔌 Déconnecté, tentative de reconnexion...');
+        if (activeStreams.has(guildId)) reportStreamError(guildId, new Error('Connexion vocale Discord interrompue'));
+        scheduleReconnect(guildId);
+    });
+}
+
+async function restoreSessions() {
+    for (const { guild_id: guildId, channel_id: channelId } of getSessions.all()) {
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) {
+            console.error(`❌ Guild sauvegardée inaccessible: ${guildId}`);
+            continue;
+        }
+
+        try {
+            const channel = await guild.channels.fetch(channelId);
+            if (!channel?.isVoiceBased()) {
+                deleteSession.run(guildId);
+                console.error(`❌ Salon vocal sauvegardé introuvable: ${guildId}/${channelId}`);
+                continue;
+            }
+
+            activeStreams.add(guildId);
+            createVoiceSession(guildId, channel.id, guild.voiceAdapterCreator);
+            startPlayback(guildId);
+            console.log(`✅ Session restaurée pour ${guildId}`);
+        } catch (err) {
+            stopStream(guildId, true);
+            console.error(`❌ Échec restauration session ${guildId}:`, err);
+        }
     }
 }
 
@@ -299,34 +374,8 @@ async function handlePlay(interaction) {
     activeStreams.add(guildId);
     if (interaction.channel?.isTextBased()) notificationChannels.set(guildId, interaction.channel);
 
-    const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId,
-        adapterCreator: interaction.guild.voiceAdapterCreator
-    });
-
-    const player = createAudioPlayer();
-    connection.subscribe(player);
-
-    players.set(guildId, player);
-    connections.set(guildId, connection);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-        console.log('⏳ Inactif, tentative de reconnexion...');
-        scheduleReconnect(guildId);
-    });
-
-    player.on('error', err => {
-        console.error('❌ Erreur lecteur:', err);
-        if (activeStreams.has(guildId)) reportStreamError(guildId, err);
-        scheduleReconnect(guildId);
-    });
-
-    connection.on(VoiceConnectionStatus.Disconnected, () => {
-        console.log('🔌 Déconnecté, tentative de reconnexion...');
-        if (activeStreams.has(guildId)) reportStreamError(guildId, new Error('Connexion vocale Discord interrompue'));
-        scheduleReconnect(guildId);
-    });
+    saveSession.run(guildId, voiceChannel.id);
+    createVoiceSession(guildId, voiceChannel.id, interaction.guild.voiceAdapterCreator);
 
     startPlayback(guildId);
 
@@ -334,11 +383,13 @@ async function handlePlay(interaction) {
 }
 
 async function handleStop(interaction) {
+    deleteSession.run(interaction.guildId);
     stopStream(interaction.guildId);
     await interaction.reply('⏹️ Radio arrêtée (bot reste connecté)');
 }
 
 async function handleDisconnect(interaction) {
+    deleteSession.run(interaction.guildId);
     stopStream(interaction.guildId, true);
 
     await interaction.reply('🔌 Déconnecté du vocal');

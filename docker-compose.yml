@@ -5,5 +5,11 @@ services:
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - RADIO_URL=${RADIO_URL}
+      - DATABASE_PATH=/app/data/radio-bot.sqlite
     restart: unless-stopped
     init: true
+    volumes:
+      - radio-bot-data:/app/data
+
+volumes:
+  radio-bot-data:

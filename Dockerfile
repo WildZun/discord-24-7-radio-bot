@@ -10,9 +10,11 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --chown=node:node . .
+RUN mkdir -p /app/data && chown node:node /app/data
 
 USER node
 
 ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV DATABASE_PATH=/app/data/radio-bot.sqlite
 
 CMD ["npm", "start"]
