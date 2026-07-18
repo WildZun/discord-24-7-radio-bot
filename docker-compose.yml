@@ -1,8 +1,6 @@
 services:
   radio-bot:
-    build:
-      context: .
-    image: discord-24-7-radio-bot:local
+    image: ghcr.io/wildzun/discord-24-7-radio-bot:master
     container_name: discord-radio-bot
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}

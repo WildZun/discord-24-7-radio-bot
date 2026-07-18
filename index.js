@@ -204,10 +204,14 @@ function createRadioResource(url, guildId) {
     ffmpeg.on('error', handleFailure);
     ffmpeg.stdout.on('error', handleFailure);
     ffmpeg.stderr.on('error', handleFailure);
-    ffmpeg.on('close', code => {
-        if (code !== 0) {
+    ffmpeg.on('close', (code, signal) => {
+        if (ffmpegProcesses.get(guildId) !== ffmpeg) return;
+
+        if (signal) {
+            handleFailure(new Error(`FFmpeg arrêté par signal ${signal}`));
+        } else if (code !== 0) {
             handleFailure(new Error(`FFmpeg arrêté avec code ${code}`));
-        } else if (activeStreams.has(guildId) && ffmpegProcesses.get(guildId) === ffmpeg) {
+        } else if (activeStreams.has(guildId)) {
             handleFailure(new Error('FFmpeg a arrêté le flux de façon inattendue'));
         }
     });

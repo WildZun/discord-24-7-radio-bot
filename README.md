@@ -30,7 +30,7 @@ cp .env.docker .env
 
 3. **Démarrer:**
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 **Option 2: Docker direct**
