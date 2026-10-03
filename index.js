@@ -5,6 +5,8 @@ const {
     createAudioResource,
     AudioPlayerStatus,
     VoiceConnectionStatus,
+    VoiceConnectionDisconnectReason,
+    entersState,
     StreamType
 } = require('@discordjs/voice');
 require('dotenv').config();
@@ -13,6 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
+const { Backoff, createSerializer, logError, syncCommands, monitorRest } = require('./reliability');
 
 // Check and force the use of opusscript
 try {
@@ -41,8 +44,7 @@ if (!RADIO_URL) {
 }
 
 console.log('✅ Variables d\'environnement chargées');
-console.log(`📻 Radio URL configurée: ${RADIO_URL}`);
-console.log(`🤖 Bot token configuré: ${TOKEN.substring(0, 20)}...`);
+console.log('📻 Radio URL et token configurés');
 
 fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 const database = new DatabaseSync(databasePath);
@@ -72,6 +74,7 @@ function checkFFmpeg() {
 const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
+monitorRest(client);
 
 const connections = new Map();
 const players = new Map();
@@ -80,19 +83,19 @@ const ffmpegProcesses = new Map();
 const activeStreams = new Set();
 const notificationChannels = new Map();
 const lastErrorNotices = new Map();
+const healthyTimers = new Map();
+const voiceRecoveries = new Map();
+const retryBackoff = new Backoff();
+const serializeGuild = createSerializer();
+const lastSessionChanges = new Map();
+let nextErrorNotice = 0;
+let shuttingDown = false;
 
 client.once('ready', async () => {
     console.log(`${client.user.tag} est connecté et prêt !`);
     console.log(`🏗️ Architecture: ${process.arch}`);
     console.log(`💻 Plateforme: ${process.platform}`);
     console.log(`🔄 Mode: Connexion permanente (24/7)`);
-
-    const ffmpegOk = await checkFFmpeg();
-    if (!ffmpegOk) {
-        console.error('❌ FFmpeg non fonctionnel ou absent.');
-        process.exit(1);
-    }
-    console.log('✅ FFmpeg détecté et fonctionnel');
 
     const commands = [
         new SlashCommandBuilder().setName('play').setDescription('Lancer la radio'),
@@ -106,13 +109,13 @@ client.once('ready', async () => {
     ];
 
     try {
-        await client.application.commands.set(commands);
+        await syncCommands(client.application.commands, commands);
         console.log('✅ Commandes slash enregistrées');
     } catch (err) {
-        console.error('❌ Erreur d’enregistrement des commandes:', err);
+        logError('Command registration', err);
     }
 
-    await restoreSessions();
+    if (!shuttingDown) await restoreSessions().catch(error => logError('Session restoration', error));
 });
 
 client.on('interactionCreate', async interaction => {
@@ -129,11 +132,12 @@ client.on('interactionCreate', async interaction => {
             case 'info': return await handleInfo(interaction);
         }
     } catch (err) {
-        console.error('❌ Erreur commande:', err);
+        logError('Command', err);
+        if ([10062, 10015, 40060].includes(Number(err.code))) return;
         if (interaction.deferred) {
-            await interaction.editReply('❌ Impossible de lancer ou gérer ce flux radio. Consulte les logs du bot.');
+            await interaction.editReply('❌ Impossible de lancer ou gérer ce flux radio. Consulte les logs du bot.').catch(error => logError('Command error response', error));
         } else if (!interaction.replied) {
-            await interaction.reply({ content: '❌ Erreur pendant la commande.', flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: '❌ Erreur pendant la commande.', flags: MessageFlags.Ephemeral }).catch(error => logError('Command error response', error));
         }
     }
 });
@@ -146,23 +150,27 @@ function stopFFmpeg(guildId) {
 }
 
 function reportStreamError(guildId, error) {
-    console.error(`❌ Erreur flux radio pour ${guildId}:`, error);
+    logError(`Radio stream ${guildId}`, error);
 
     const now = Date.now();
     if (now - (lastErrorNotices.get(guildId) || 0) < 60000) return;
     lastErrorNotices.set(guildId, now);
+    if (now < nextErrorNotice) return;
+    nextErrorNotice = now + 1000;
 
     const channel = notificationChannels.get(guildId);
     if (channel?.isTextBased()) {
         channel.send('⚠️ Flux radio interrompu. Reconnexion automatique en cours.').catch(err => {
-            console.error(`❌ Impossible d’envoyer erreur flux pour ${guildId}:`, err);
+            if (err.status === 403 || Number(err.code) === 10003) notificationChannels.delete(guildId);
+            logError(`Stream notification ${guildId}`, err);
         });
     }
 }
 
 function stopStream(guildId, disconnect = false) {
     activeStreams.delete(guildId);
-    lastErrorNotices.delete(guildId);
+    retryBackoff.reset(guildId);
+    clearHealthyTimer(guildId);
     stopFFmpeg(guildId);
 
     const timer = reconnectTimers.get(guildId);
@@ -175,10 +183,17 @@ function stopStream(guildId, disconnect = false) {
 
     if (disconnect) {
         const connection = connections.get(guildId);
-        if (connection) connection.destroy();
         connections.delete(guildId);
+        voiceRecoveries.delete(guildId);
+        if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
         notificationChannels.delete(guildId);
     }
+}
+
+function clearHealthyTimer(guildId) {
+    const timer = healthyTimers.get(guildId);
+    if (timer) clearTimeout(timer);
+    healthyTimers.delete(guildId);
 }
 
 function createVoiceSession(guildId, channelId, adapterCreator) {
@@ -190,47 +205,104 @@ function createVoiceSession(guildId, channelId, adapterCreator) {
     connections.set(guildId, connection);
 
     player.on(AudioPlayerStatus.Idle, () => {
-        console.log('⏳ Inactif, tentative de reconnexion...');
+        if (players.get(guildId) !== player) return;
+        clearHealthyTimer(guildId);
         scheduleReconnect(guildId);
     });
 
+    player.on(AudioPlayerStatus.Playing, () => {
+        if (players.get(guildId) !== player) return;
+        clearHealthyTimer(guildId);
+        healthyTimers.set(guildId, setTimeout(() => {
+            healthyTimers.delete(guildId);
+            if (players.get(guildId) === player && player.state.status === AudioPlayerStatus.Playing) retryBackoff.reset(guildId);
+        }, 30000));
+    });
+
     player.on('error', err => {
-        console.error('❌ Erreur lecteur:', err);
+        if (players.get(guildId) !== player) return;
+        clearHealthyTimer(guildId);
         if (activeStreams.has(guildId)) reportStreamError(guildId, err);
         scheduleReconnect(guildId);
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, () => {
-        console.log('🔌 Déconnecté, tentative de reconnexion...');
+        if (connections.get(guildId) !== connection) return;
         if (activeStreams.has(guildId)) reportStreamError(guildId, new Error('Connexion vocale Discord interrompue'));
+        recoverVoice(guildId, connection);
+    });
+    connection.on('error', error => {
+        if (connections.get(guildId) !== connection) return;
+        reportStreamError(guildId, error);
         scheduleReconnect(guildId);
     });
+    return connection;
+}
+
+function recoverVoice(guildId, connection) {
+    if (voiceRecoveries.has(guildId)) return;
+    const recovery = (async () => {
+        try {
+            if (connection.state.reason === VoiceConnectionDisconnectReason.WebSocketClose && connection.state.closeCode === 4014) {
+                // Moves can recover. Kicks must not cause repeated automatic joins.
+                await Promise.race([
+                    entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+                    entersState(connection, VoiceConnectionStatus.Connecting, 5000)
+                ]);
+                await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+            } else {
+                await entersState(connection, VoiceConnectionStatus.Ready, 5000);
+            }
+            if (connections.get(guildId) === connection) startPlayback(guildId);
+        } catch (error) {
+            if (connections.get(guildId) !== connection || !activeStreams.has(guildId)) return;
+            if (connection.state.closeCode === 4014) {
+                await serializeGuild(guildId, () => {
+                    if (connections.get(guildId) !== connection) return;
+                    deleteSession.run(guildId);
+                    stopStream(guildId, true);
+                });
+                logError(`Voice session stopped after kick ${guildId}`, error);
+            } else {
+                scheduleReconnect(guildId);
+            }
+        }
+    })();
+    voiceRecoveries.set(guildId, recovery);
+    recovery.finally(() => {
+        if (voiceRecoveries.get(guildId) === recovery) voiceRecoveries.delete(guildId);
+    }).catch(error => logError(`Voice recovery ${guildId}`, error));
 }
 
 async function restoreSessions() {
     for (const { guild_id: guildId, channel_id: channelId } of getSessions.all()) {
-        const guild = client.guilds.cache.get(guildId);
-        if (!guild) {
-            console.error(`❌ Guild sauvegardée inaccessible: ${guildId}`);
-            continue;
-        }
-
-        try {
-            const channel = await guild.channels.fetch(channelId);
-            if (!channel?.isVoiceBased()) {
-                deleteSession.run(guildId);
-                console.error(`❌ Salon vocal sauvegardé introuvable: ${guildId}/${channelId}`);
-                continue;
+        await serializeGuild(guildId, async () => {
+            if (shuttingDown || activeStreams.has(guildId)) return;
+            const guild = client.guilds.cache.get(guildId);
+            if (!guild) {
+                console.error(`❌ Guild sauvegardée inaccessible: ${guildId}`);
+                return;
             }
 
-            activeStreams.add(guildId);
-            createVoiceSession(guildId, channel.id, guild.voiceAdapterCreator);
-            startPlayback(guildId);
-            console.log(`✅ Session restaurée pour ${guildId}`);
-        } catch (err) {
-            stopStream(guildId, true);
-            console.error(`❌ Échec restauration session ${guildId}:`, err);
-        }
+            try {
+                const channel = await guild.channels.fetch(channelId);
+                if (!channel?.isVoiceBased()) {
+                    deleteSession.run(guildId);
+                    console.error(`❌ Salon vocal sauvegardé introuvable: ${guildId}/${channelId}`);
+                    return;
+                }
+
+                activeStreams.add(guildId);
+                const connection = createVoiceSession(guildId, channel.id, guild.voiceAdapterCreator);
+                await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+                startPlayback(guildId);
+                console.log(`✅ Session restaurée pour ${guildId}`);
+            } catch (err) {
+                if (Number(err.code) === 10003) deleteSession.run(guildId);
+                if (connections.has(guildId)) scheduleReconnect(guildId);
+                logError(`Session restore ${guildId}`, err);
+            }
+        });
     }
 }
 
@@ -243,6 +315,10 @@ function hasHumanListeners(guildId) {
 }
 
 function pauseStream(guildId) {
+    clearHealthyTimer(guildId);
+    const timer = reconnectTimers.get(guildId);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(guildId);
     stopFFmpeg(guildId);
     const player = players.get(guildId);
     if (player) player.stop(true);
@@ -307,36 +383,48 @@ function startPlayback(guildId) {
 
     const player = players.get(guildId);
     if (!player || player.state.status !== AudioPlayerStatus.Idle) return;
+    if (connections.get(guildId)?.state.status !== VoiceConnectionStatus.Ready) {
+        scheduleReconnect(guildId);
+        return;
+    }
 
     const resource = createRadioResource(RADIO_URL, guildId);
     player.play(resource);
     console.log(`▶️ Flux lancé pour ${guildId}`);
 }
 
-function scheduleReconnect(guildId, delay = 10000) {
-    if (!activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
-    if (reconnectTimers.has(guildId)) clearTimeout(reconnectTimers.get(guildId));
+function scheduleReconnect(guildId) {
+    if (shuttingDown || !activeStreams.has(guildId) || !hasHumanListeners(guildId) || reconnectTimers.has(guildId)) return;
+    clearHealthyTimer(guildId);
+    const delay = retryBackoff.next(guildId);
 
     const timer = setTimeout(async () => {
         if (reconnectTimers.get(guildId) !== timer) return;
         reconnectTimers.delete(guildId);
 
         if (!activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
-        if (players.has(guildId)) {
-            try {
-                startPlayback(guildId);
-                console.log(`✅ Reconnexion réussie pour ${guildId}`);
-            } catch (err) {
-                console.error(`❌ Échec de reconnexion pour ${guildId}:`, err);
-                scheduleReconnect(guildId, Math.min(delay * 2, 60000));
+        await serializeGuild(guildId, async () => {
+            if (shuttingDown || !activeStreams.has(guildId) || !hasHumanListeners(guildId)) return;
+            if (players.has(guildId)) {
+                try {
+                    const connection = connections.get(guildId);
+                    if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) return;
+                    if (connection.state.status === VoiceConnectionStatus.Disconnected) connection.rejoin();
+                    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+                    startPlayback(guildId);
+                } catch (err) {
+                    logError(`Reconnect ${guildId}`, err);
+                    scheduleReconnect(guildId);
+                }
             }
-        }
+        }).catch(error => logError(`Reconnect task ${guildId}`, error));
     }, delay);
 
     reconnectTimers.set(guildId, timer);
 }
 
 client.on('voiceStateUpdate', (oldState, newState) => {
+    if (oldState.channelId === newState.channelId) return;
     const guildId = newState.guild.id;
     const connection = connections.get(guildId);
     const channelId = connection?.joinConfig.channelId;
@@ -349,9 +437,11 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         return;
     }
 
-    const timer = reconnectTimers.get(guildId);
-    if (timer) clearTimeout(timer);
-    reconnectTimers.delete(guildId);
+    if (reconnectTimers.has(guildId)) return;
+    if (retryBackoff.remaining(guildId) > 0) {
+        scheduleReconnect(guildId);
+        return;
+    }
 
     try {
         startPlayback(guildId);
@@ -362,7 +452,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 async function handlePlay(interaction) {
-    const voiceChannel = interaction.member.voice.channel;
+    const voiceChannel = interaction.member?.voice?.channel;
     const guildId = interaction.guildId;
 
     if (!voiceChannel) {
@@ -370,29 +460,51 @@ async function handlePlay(interaction) {
     }
 
     await interaction.deferReply();
-    stopStream(guildId, true);
-    activeStreams.add(guildId);
-    if (interaction.channel?.isTextBased()) notificationChannels.set(guildId, interaction.channel);
+    return serializeGuild(guildId, async () => {
+        if (shuttingDown) return interaction.editReply('⏳ Bot en cours d’arrêt.');
+        if (interaction.member.voice.channel?.id !== voiceChannel.id) return interaction.editReply('❌ Ton salon vocal a changé. Relance la commande.');
+        const current = connections.get(guildId);
+        if (activeStreams.has(guildId) && current?.joinConfig.channelId === voiceChannel.id && current.state.status !== VoiceConnectionStatus.Destroyed) {
+            return interaction.editReply(`🎶 Radio déjà active dans **${voiceChannel.name}**.`);
+        }
+        if (Date.now() - (lastSessionChanges.get(guildId) || 0) < 5000) return interaction.editReply('⏳ Patiente 5 secondes entre les changements de salon.');
+        lastSessionChanges.set(guildId, Date.now());
+        stopStream(guildId, true);
+        activeStreams.add(guildId);
+        if (interaction.channel?.isTextBased()) notificationChannels.set(guildId, interaction.channel);
 
-    saveSession.run(guildId, voiceChannel.id);
-    createVoiceSession(guildId, voiceChannel.id, interaction.guild.voiceAdapterCreator);
+        saveSession.run(guildId, voiceChannel.id);
+        const connection = createVoiceSession(guildId, voiceChannel.id, interaction.guild.voiceAdapterCreator);
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+        } catch (error) {
+            scheduleReconnect(guildId);
+            throw error;
+        }
 
-    startPlayback(guildId);
+        startPlayback(guildId);
 
-    await interaction.editReply(`🎶 Radio lancée dans **${voiceChannel.name}** en 24/7`);
+        await interaction.editReply(`🎶 Radio lancée dans **${voiceChannel.name}** en 24/7`);
+    });
 }
 
 async function handleStop(interaction) {
-    deleteSession.run(interaction.guildId);
-    stopStream(interaction.guildId);
-    await interaction.reply('⏹️ Radio arrêtée (bot reste connecté)');
+    await interaction.deferReply();
+    return serializeGuild(interaction.guildId, async () => {
+        deleteSession.run(interaction.guildId);
+        stopStream(interaction.guildId);
+        await interaction.editReply('⏹️ Radio arrêtée (bot reste connecté)');
+    });
 }
 
 async function handleDisconnect(interaction) {
-    deleteSession.run(interaction.guildId);
-    stopStream(interaction.guildId, true);
+    await interaction.deferReply();
+    return serializeGuild(interaction.guildId, async () => {
+        deleteSession.run(interaction.guildId);
+        stopStream(interaction.guildId, true);
 
-    await interaction.reply('🔌 Déconnecté du vocal');
+        await interaction.editReply('🔌 Déconnecté du vocal');
+    });
 }
 
 async function handleVolume(interaction) {
@@ -428,4 +540,28 @@ async function handleInfo(interaction) {
     await interaction.reply({ embeds: [embed] });
 }
 
-client.login(TOKEN);
+async function start() {
+    if (!await checkFFmpeg()) throw new Error('FFmpeg non fonctionnel ou absent.');
+    await client.login(TOKEN);
+}
+
+async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const guildId of connections.keys()) stopStream(guildId, true);
+    client.destroy();
+    database.close();
+}
+
+process.once('SIGINT', () => shutdown().catch(error => logError('Shutdown', error)));
+process.once('SIGTERM', () => shutdown().catch(error => logError('Shutdown', error)));
+client.on('error', error => logError('Discord client', error));
+
+if (require.main === module) {
+    start().catch(error => {
+        logError('Startup', error);
+        process.exitCode = 1;
+        client.destroy();
+        database.close();
+    });
+}

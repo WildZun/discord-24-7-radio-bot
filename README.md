@@ -103,6 +103,32 @@ RADIO_URL=https://ton-stream-radio.mp3
 
 ## 🛠️ Dépannage
 
+### Rate limiting et reconnexions
+
+- `/play` dans le salon déjà actif ne recrée pas la connexion. Les commandes et la restauration sont sérialisées par serveur ; un changement de salon est limité à un toutes les 5 secondes.
+- Les erreurs asynchrones utilisent un backoff exponentiel de 10 secondes à 5 minutes, avec jitter. Seules 30 secondes de lecture saine réinitialisent ce backoff. Les événements mute/deafen ne contournent pas les délais.
+- La récupération du vocal attend l'état Ready. Un kick Discord (4014) arrête la session si aucune récupération de déplacement n'est possible, sans boucle de rejoin.
+- Les notifications d'erreur sont limitées à une par serveur/minute et une par seconde pour le processus. Un salon inaccessible est retiré des notifications.
+- FFmpeg est vérifié avant le login Discord. Les commandes sont réenregistrées uniquement si leur définition change.
+- `discord_rate_wait` indique une attente SDK ; `discord_http_error` indique une erreur HTTP réelle avec scope, bucket, route anonymisée et `Retry-After`. Les 429 sans délai exploitable échouent au lieu d'être réessayés en boucle.
+
+Tests hors ligne et contrôle de syntaxe :
+
+```bash
+npm test
+npm run check
+```
+
+Pour appliquer le code local au déploiement Compose existant :
+
+```bash
+docker compose build radio-bot
+docker compose up -d --no-deps radio-bot
+docker compose logs -f radio-bot
+```
+
+Le service `init-data` reste utilisé pour une première installation. La reconstruction locale conserve `./data/radio-bot.sqlite`. Un simple redémarrage d'une ancienne image GHCR ne charge pas les correctifs.
+
 - **FFmpeg:** fourni par `ffmpeg-static` lors de `npm install`
 - **Erreurs Opus:** `npm install opusscript`
 - **Windows ARM:** `npm install --no-optional`
